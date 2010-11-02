@@ -5,6 +5,7 @@ using System.Text;
 using System.Xml;
 using System.Net;
 using System.IO;
+using System.Threading;
 
 using Microsoft.SharePoint.Utilities;
 using Microsoft.SharePoint.Administration; 
@@ -12,24 +13,19 @@ using Microsoft.SharePoint;
 
 namespace MarabouStork.Sharepoint.LinkChecker
 {
-    class LinkChecker
+    public class LinkChecker
     {
         static Regex urlRegEx = new Regex(@"http(s)?://([\w+?\.\w+])+([a-zA-Z0-9\~\!\@\#\$\%\^\&amp;\*\(\)_\-\=\+\\\/\?\.\:\;\'\,]*)?|]*?HREF\s*=\s*[""']?([^'"" >]+?)[ '""]?[^>]*?>");
 
-        static readonly string userAgent = ""; // Do we need to set a user agent for the scraper.
+        static readonly string userAgent = "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.0)"; // Do we need to set a user agent for the scraper.
         static string baseSiteUrl = "http://localhost:8081";
         static bool shouldUnpublish = true;
+        static bool debug = false;
 
         /// <summary>
         ///     Determine if any of the documents in the test libraries contain references
         ///     to invalid urls
         /// </summary>
-        /// <param name="siteUrl">
-        ///     The url of the sharepoint site containing the document libraries to examine
-        /// </param>
-        /// <param name="webApplication">
-        ///     The instance of <see cref="SPWebApplication"/> which acts as the parent fo the persisted settings
-        /// </param>
         /// <param name="modsSinceDate">
         ///     Used to retrieve documents that have been modified since the date provided
         /// </param>
@@ -38,8 +34,8 @@ namespace MarabouStork.Sharepoint.LinkChecker
             baseSiteUrl = siteUrl;
 
             var farm = Microsoft.SharePoint.Administration.SPFarm.Local;
-            var settings = farm.GetObject("MarabouStork.Sharepoint.LinkChecker.LinkCheckerSettings", webApplication.Id, typeof(LinkCheckerPersistedSettings)) as LinkCheckerPersistedSettings;
-
+            var settings = farm.GetObject("Nhs.Evidence.Arms.LinkCheckerSettings", webApplication.Id, typeof(LinkCheckerPersistedSettings)) as LinkCheckerPersistedSettings;
+            
             if (settings != null)
             {
                 // Determine the list of document libraries to check
@@ -53,14 +49,14 @@ namespace MarabouStork.Sharepoint.LinkChecker
                 // Should we unpublish documents that contain invalid urls?
                 shouldUnpublish = settings.UnpublishInvalidDocs;
 
-                var query = "<Query>" +
-                            "   <Where>" +
-                            "      <Gt>" +
-                            "          <FieldRef Name='Modified' IncludeTimeValue='TRUE'/>" +
-                            "          <Value Type='DateTime'>{0}</Value>" +
-                            "      </Gt>" +
-                            "   </Where>" +
-                            "</Query>";
+                //TODO: The CAML doesnt really need to worry about the modified date I dont think, although this could be used to make
+                //      the checkatron more efficient if it is ran quite frequently.
+                var query = "<Where>" +
+                            "   <Gt>" +
+                            "       <FieldRef Name='Modified' IncludeTimeValue='TRUE'/>" +
+                            "       <Value Type='DateTime'>{0}</Value>" +
+                            "   </Gt>" +
+                            "</Where>";
 
                 var retrvDt = SPUtility.CreateISO8601DateTimeFromSystemDateTime(modsSinceDate);
                 var caml = new SPQuery { DatesInUtc = true, Query = string.Format(query, retrvDt) };
@@ -116,6 +112,8 @@ namespace MarabouStork.Sharepoint.LinkChecker
                                                 }
 
                                                 // Now that we have a published version of a document check the urls it contains
+                                                if (debug)
+                                                    Console.WriteLine("Checking Document : " + document.Name);
                                                 CheckDocURls(document, docContents, fieldsToCheck);
                                             }
                                         }
@@ -230,6 +228,9 @@ namespace MarabouStork.Sharepoint.LinkChecker
                     }
                 }
             });
+
+            if (debug)
+                Console.WriteLine("The document was unpublished because it contains an invalid link. The link checker returned the following message \r\n\r\n" + validationMessage);
         }
 
         /// <summary>
@@ -261,6 +262,9 @@ namespace MarabouStork.Sharepoint.LinkChecker
         /// </returns>
         private static bool ValidateUrl(string url, out string message)
         {
+            if (debug)
+                Console.WriteLine("Checking Url : " + url);
+
             bool retVal = true;
 
             message = string.Empty;
@@ -268,38 +272,37 @@ namespace MarabouStork.Sharepoint.LinkChecker
             Uri uri;
             if (Uri.TryCreate(url, UriKind.Absolute, out uri))
             {
-
-                // Cookies ?
-                HttpWebRequest objRequest = (HttpWebRequest)System.Net.HttpWebRequest.Create(url);
-                CookieContainer cookieContainer = new CookieContainer();
-
-                if (!String.IsNullOrEmpty(userAgent))
-                {
-                    objRequest.UserAgent = userAgent;
-                }
-
-                objRequest.CookieContainer = cookieContainer;
-                objRequest.AllowAutoRedirect = true;
-                objRequest.MaximumAutomaticRedirections = 5;
-
-                HttpWebResponse objResponse = null;
-
                 // Try to fetch the page from the given URL, in case of any error return null string
                 try
                 {
-                    objResponse = (HttpWebResponse)objRequest.GetResponse();
-
-                    // In case of page not found error, return null string
-                    if (objResponse.StatusCode != HttpStatusCode.OK)
-                    {
-                        retVal = false;
-                        message = objResponse.StatusDescription + " Please review the url " + url;
-                    }
+                    checklink(url, ref message, ref retVal);
                 }
-                catch (Exception ex)
+                catch (WebException ex)
                 {
-                    message = "An error occured while querying the specified url: " + ex.Message + " Please review the url " + url;
-                    retVal = false;
+                    //The Exception handler seems to be triggered regardless
+                    if (ex.Status == WebExceptionStatus.Timeout)
+                    {
+                        try
+                        {
+                            Thread.Sleep(new TimeSpan(0, 0, 10));
+
+                            checklink(url, ref message, ref retVal);
+                        }
+                        catch (WebException innerEx)
+                        {
+                            if (innerEx.Status == WebExceptionStatus.Timeout)
+                            {
+                                ex = null; // Clear the original exception
+                            }
+                            else
+                                ex = innerEx;
+                        }
+                    }
+                    if (ex != null)
+                    {
+                        message = "An error occured  while querying the specified url: " + ex.Message + " Please review the url " + url;
+                        retVal = false;
+                    }
                 }
             }
             else
@@ -309,6 +312,35 @@ namespace MarabouStork.Sharepoint.LinkChecker
             }
 
             return retVal;
+        }
+
+        private static void checklink(string url, ref string message, ref bool retVal)
+        {
+            // Cookies ?
+            HttpWebRequest objRequest = (HttpWebRequest)System.Net.HttpWebRequest.Create(url);
+            CookieContainer cookieContainer = new CookieContainer();
+
+            if (!String.IsNullOrEmpty(userAgent))
+            {
+                objRequest.UserAgent = userAgent;
+            }
+
+            objRequest.CookieContainer = cookieContainer;
+            objRequest.AllowAutoRedirect = true;
+            objRequest.MaximumAutomaticRedirections = 5;
+            objRequest.Method = "HEAD";
+            HttpWebResponse objResponse = null;
+
+            objResponse = (HttpWebResponse)objRequest.GetResponse();
+
+            // In case of page not found error, return null string
+            if (objResponse.StatusCode != HttpStatusCode.OK)
+            {
+                retVal = false;
+                message = objResponse.StatusDescription + " Please review the url " + url;
+            }
+            
+            objResponse.Close();
         }
 
         /// <summary>
